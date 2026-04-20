@@ -1,0 +1,509 @@
+name: release artifacts
+
+# Produces per-platform C/C++ artifacts that the envector-go-sdk (and other
+# downstream consumers) can drop into third_party/evi/<goos>_<goarch>/.
+#
+# Matrix covers the targets listed in the Go SDK's PROVENANCE
+# (linux_{amd64,arm64}, darwin_{amd64,arm64}) plus windows_amd64 which the
+# main repo's windows-build.yml already exercises.
+#
+# Each job emits:
+#   lib/libevi_crypto.a                    (static core)
+#   lib/libevi_crypto.{so,dylib}           (shared core)         -- *nix
+#   lib/evi_crypto.lib / evi_crypto.dll    (static + shared)     -- Windows
+#   lib/libevi_c_api.a / evi_c_api.lib     (C wrapper, always static)
+#   include/                               (C++ headers + C wrapper headers)
+#   PROVENANCE                             (commit, ref, runner, timestamp)
+# then uploads the packed archive as a GitHub Actions artifact. On tag pushes
+# matching v*, a final job attaches every archive to a GitHub Release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag, or SHA). Defaults to the triggering ref."
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/release.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # needed by the release job to upload assets
+
+jobs:
+  build-linux:
+    name: build linux_${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04,     goarch: amd64 }
+          - { runner: ubuntu-22.04-arm, goarch: arm64 }
+    env:
+      GOOS: linux
+      GOARCH: ${{ matrix.goarch }}
+      SHARED_EXT: so
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            git \
+            libssl-dev \
+            ninja-build \
+            pkg-config
+
+      - name: Configure static
+        run: |
+          cmake -S . -B build-static -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TEST=OFF \
+            -DBUILD_EXAMPLE=OFF \
+            -DBUILD_WITH_VALGRIND=OFF \
+            -DBUILD_C_API=ON \
+            -DBUILD_KEY_MANAGEMENT=ON \
+            -DEVI_KM_PREFER_AWS_SDK=OFF \
+            -DEVI_KM_PREFER_GCP_SDK=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_AS_STATIC=ON
+
+      - name: Build static
+        run: cmake --build build-static --parallel
+
+      - name: Configure shared
+        run: |
+          cmake -S . -B build-shared -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TEST=OFF \
+            -DBUILD_EXAMPLE=OFF \
+            -DBUILD_WITH_VALGRIND=OFF \
+            -DBUILD_C_API=ON \
+            -DBUILD_KEY_MANAGEMENT=ON \
+            -DEVI_KM_PREFER_AWS_SDK=OFF \
+            -DEVI_KM_PREFER_GCP_SDK=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_AS_STATIC=OFF
+
+      - name: Build shared
+        run: cmake --build build-shared --parallel
+
+      - name: Assemble package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="evi-crypto-${GOOS}_${GOARCH}"
+          root="${GITHUB_WORKSPACE}/${pkg}"
+          rm -rf "${root}"
+          mkdir -p "${root}/lib" "${root}/include"
+
+          # locate the freshly built libs (cmake may place them under lib/ in
+          # some configurations, otherwise at the top of the build dir)
+          find_one() {
+            local pattern="$1" dir="$2"
+            local hit
+            hit="$(find "${dir}" -maxdepth 4 -type f -name "${pattern}" | head -n 1)"
+            if [[ -z "${hit}" ]]; then
+              echo "expected ${pattern} under ${dir}, got none" >&2
+              find "${dir}" -maxdepth 4 -type f -name 'libevi*' >&2 || true
+              exit 1
+            fi
+            echo "${hit}"
+          }
+
+          cp "$(find_one 'libevi_crypto.a'           build-static)" "${root}/lib/"
+          cp "$(find_one 'libevi_c_api.a'            build-static)" "${root}/lib/"
+          cp "$(find_one "libevi_crypto.${SHARED_EXT}" build-shared)" "${root}/lib/"
+
+          # headers: everything under include/ (C++ API) and c_api/include/
+          # (C ABI umbrella + evi_c/*.h) merged into one tree.
+          cp -R include/. "${root}/include/"
+          cp -R c_api/include/. "${root}/include/"
+
+          # provenance marker
+          {
+            echo "name: evi-crypto"
+            echo "goos: ${GOOS}"
+            echo "goarch: ${GOARCH}"
+            echo "commit: $(git rev-parse HEAD)"
+            echo "ref: ${GITHUB_REF}"
+            echo "runner: ${{ matrix.runner }}"
+            echo "built_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "${root}/PROVENANCE"
+
+          cd "${GITHUB_WORKSPACE}"
+          tar czf "${pkg}.tar.gz" "${pkg}"
+          sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+          echo "name=${pkg}" >> "${GITHUB_OUTPUT}"
+          echo "archive=${pkg}.tar.gz" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            ${{ steps.pkg.outputs.archive }}
+            ${{ steps.pkg.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  build-macos:
+    # Both darwin slices run on the Apple Silicon runner. The amd64 build is
+    # produced by cross-compiling with -DCMAKE_OSX_ARCHITECTURES=x86_64; clang
+    # handles the cross toolchain natively, and Rosetta 2 is used only to run
+    # the x86_64 Homebrew installer so we can fetch an x86_64 OpenSSL to link
+    # against (no x86_64 compile/link steps are emulated).
+    name: build darwin_${{ matrix.goarch }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goarch: arm64, osx_arch: arm64,  brew_prefix: /opt/homebrew }
+          - { goarch: amd64, osx_arch: x86_64, brew_prefix: /usr/local }
+    env:
+      GOOS: darwin
+      GOARCH: ${{ matrix.goarch }}
+      SHARED_EXT: dylib
+      OSX_ARCH: ${{ matrix.osx_arch }}
+      BREW_PREFIX: ${{ matrix.brew_prefix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install native build tools (ninja)
+        run: |
+          /opt/homebrew/bin/brew update
+          /opt/homebrew/bin/brew install ninja
+
+      - name: Install arm64 OpenSSL (native)
+        if: matrix.osx_arch == 'arm64'
+        run: /opt/homebrew/bin/brew install openssl@3 libomp
+
+      - name: Install Rosetta 2 + x86_64 Homebrew + OpenSSL
+        if: matrix.osx_arch == 'x86_64'
+        run: |
+          set -euxo pipefail
+          # Rosetta is required to run the x86_64 brew binary. The actual C/C++
+          # build is cross-compiled natively by arm64 clang (no emulation).
+          softwareupdate --install-rosetta --agree-to-license
+          if [[ ! -x /usr/local/bin/brew ]]; then
+            NONINTERACTIVE=1 arch -x86_64 /bin/bash -c \
+              "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          fi
+          arch -x86_64 /usr/local/bin/brew update
+          arch -x86_64 /usr/local/bin/brew install openssl@3 libomp
+
+      - name: Configure static
+        run: |
+          set -euo pipefail
+          OPENSSL_ROOT="${BREW_PREFIX}/opt/openssl@3"
+          cmake -S . -B build-static -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="${OSX_ARCH}" \
+            -DBUILD_TEST=OFF \
+            -DBUILD_EXAMPLE=OFF \
+            -DBUILD_WITH_VALGRIND=OFF \
+            -DBUILD_C_API=ON \
+            -DBUILD_KEY_MANAGEMENT=ON \
+            -DEVI_KM_PREFER_AWS_SDK=OFF \
+            -DEVI_KM_PREFER_GCP_SDK=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_AS_STATIC=ON \
+            -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT}"
+
+      - name: Build static
+        run: cmake --build build-static --parallel
+
+      - name: Configure shared
+        run: |
+          set -euo pipefail
+          OPENSSL_ROOT="${BREW_PREFIX}/opt/openssl@3"
+          cmake -S . -B build-shared -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="${OSX_ARCH}" \
+            -DBUILD_TEST=OFF \
+            -DBUILD_EXAMPLE=OFF \
+            -DBUILD_WITH_VALGRIND=OFF \
+            -DBUILD_C_API=ON \
+            -DBUILD_KEY_MANAGEMENT=ON \
+            -DEVI_KM_PREFER_AWS_SDK=OFF \
+            -DEVI_KM_PREFER_GCP_SDK=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_AS_STATIC=OFF \
+            -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT}"
+
+      - name: Build shared
+        run: cmake --build build-shared --parallel
+
+      - name: Verify produced architecture
+        run: |
+          set -euo pipefail
+          for f in \
+            build-static/libevi_crypto.a \
+            build-static/c_api/libevi_c_api.a \
+            "build-shared/libevi_crypto.${SHARED_EXT}"; do
+            [[ -f "$f" ]] || continue
+            echo "== lipo -info $f"
+            lipo -info "$f" || file "$f"
+          done
+
+      - name: Assemble package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="evi-crypto-${GOOS}_${GOARCH}"
+          root="${GITHUB_WORKSPACE}/${pkg}"
+          rm -rf "${root}"
+          mkdir -p "${root}/lib" "${root}/include"
+
+          find_one() {
+            local pattern="$1" dir="$2"
+            local hit
+            hit="$(find "${dir}" -maxdepth 4 -type f -name "${pattern}" | head -n 1)"
+            if [[ -z "${hit}" ]]; then
+              echo "expected ${pattern} under ${dir}, got none" >&2
+              find "${dir}" -maxdepth 4 -type f -name 'libevi*' >&2 || true
+              exit 1
+            fi
+            echo "${hit}"
+          }
+
+          cp "$(find_one 'libevi_crypto.a'           build-static)" "${root}/lib/"
+          cp "$(find_one 'libevi_c_api.a'            build-static)" "${root}/lib/"
+          cp "$(find_one "libevi_crypto.${SHARED_EXT}" build-shared)" "${root}/lib/"
+
+          cp -R include/. "${root}/include/"
+          cp -R c_api/include/. "${root}/include/"
+
+          {
+            echo "name: evi-crypto"
+            echo "goos: ${GOOS}"
+            echo "goarch: ${GOARCH}"
+            echo "commit: $(git rev-parse HEAD)"
+            echo "ref: ${GITHUB_REF}"
+            echo "runner: macos-14"
+            echo "osx_arch: ${OSX_ARCH}"
+            echo "built_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "${root}/PROVENANCE"
+
+          cd "${GITHUB_WORKSPACE}"
+          tar czf "${pkg}.tar.gz" "${pkg}"
+          shasum -a 256 "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+          echo "name=${pkg}" >> "${GITHUB_OUTPUT}"
+          echo "archive=${pkg}.tar.gz" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            ${{ steps.pkg.outputs.archive }}
+            ${{ steps.pkg.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  build-windows:
+    name: build windows_amd64
+    runs-on: windows-latest
+    env:
+      GOOS: windows
+      GOARCH: amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install OpenSSL
+        shell: pwsh
+        run: choco install openssl --yes --no-progress
+
+      - name: Discover OpenSSL paths
+        shell: pwsh
+        run: |
+          $roots = @(
+            "C:\Program Files\OpenSSL-Win64",
+            "C:\Program Files\OpenSSL",
+            "C:\tools\openssl",
+            "C:\Program Files (x86)\OpenSSL-Win32"
+          ) | Where-Object { Test-Path $_ }
+
+          if ($roots.Count -eq 0) { throw "OpenSSL installation root not found" }
+
+          $crypto = $null; $ssl = $null; $include = $null; $rootDir = $null
+          foreach ($root in $roots) {
+            $crypto = Get-ChildItem -Path $root -Recurse -Filter libcrypto.lib -ErrorAction SilentlyContinue | Select-Object -First 1
+            $ssl    = Get-ChildItem -Path $root -Recurse -Filter libssl.lib    -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ((Test-Path (Join-Path $root "include\openssl\ssl.h")) -and $crypto -and $ssl) {
+              $include = Join-Path $root "include"
+              $rootDir = $root
+              break
+            }
+          }
+          if (-not $rootDir) { throw "Failed to discover OpenSSL headers and libraries" }
+
+          "OPENSSL_ROOT_DIR=$rootDir"                   >> $env:GITHUB_ENV
+          "OPENSSL_INCLUDE_DIR=$include"                >> $env:GITHUB_ENV
+          "OPENSSL_CRYPTO_LIBRARY=$($crypto.FullName)"  >> $env:GITHUB_ENV
+          "OPENSSL_SSL_LIBRARY=$($ssl.FullName)"        >> $env:GITHUB_ENV
+          "$rootDir\bin"                                 >> $env:GITHUB_PATH
+
+      - name: Configure static
+        shell: pwsh
+        run: |
+          cmake -S . -B build-static -G "Visual Studio 17 2022" -A x64 `
+            -DOPENSSL_ROOT_DIR="${env:OPENSSL_ROOT_DIR}" `
+            -DOPENSSL_INCLUDE_DIR="${env:OPENSSL_INCLUDE_DIR}" `
+            -DOPENSSL_CRYPTO_LIBRARY="${env:OPENSSL_CRYPTO_LIBRARY}" `
+            -DOPENSSL_SSL_LIBRARY="${env:OPENSSL_SSL_LIBRARY}" `
+            -DBUILD_TEST=OFF `
+            -DBUILD_EXAMPLE=OFF `
+            -DBUILD_WITH_VALGRIND=OFF `
+            -DBUILD_C_API=ON `
+            -DBUILD_KEY_MANAGEMENT=ON `
+            -DEVI_KM_PREFER_AWS_SDK=OFF `
+            -DEVI_KM_PREFER_GCP_SDK=OFF `
+            -DBUILD_AS_STATIC=ON
+
+      - name: Build static
+        shell: pwsh
+        run: cmake --build build-static --config Release --parallel
+
+      - name: Configure shared
+        shell: pwsh
+        run: |
+          cmake -S . -B build-shared -G "Visual Studio 17 2022" -A x64 `
+            -DOPENSSL_ROOT_DIR="${env:OPENSSL_ROOT_DIR}" `
+            -DOPENSSL_INCLUDE_DIR="${env:OPENSSL_INCLUDE_DIR}" `
+            -DOPENSSL_CRYPTO_LIBRARY="${env:OPENSSL_CRYPTO_LIBRARY}" `
+            -DOPENSSL_SSL_LIBRARY="${env:OPENSSL_SSL_LIBRARY}" `
+            -DBUILD_TEST=OFF `
+            -DBUILD_EXAMPLE=OFF `
+            -DBUILD_WITH_VALGRIND=OFF `
+            -DBUILD_C_API=ON `
+            -DBUILD_KEY_MANAGEMENT=ON `
+            -DEVI_KM_PREFER_AWS_SDK=OFF `
+            -DEVI_KM_PREFER_GCP_SDK=OFF `
+            -DBUILD_AS_STATIC=OFF
+
+      - name: Build shared
+        shell: pwsh
+        run: cmake --build build-shared --config Release --parallel
+
+      - name: Assemble package
+        id: pkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg  = "evi-crypto-$env:GOOS`_$env:GOARCH"
+          $root = Join-Path $env:GITHUB_WORKSPACE $pkg
+          if (Test-Path $root) { Remove-Item -Recurse -Force $root }
+          New-Item -ItemType Directory -Force -Path "$root/lib", "$root/include" | Out-Null
+
+          function FindOne($pattern, $dir) {
+            $hit = Get-ChildItem -Path $dir -Recurse -Filter $pattern -File -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if (-not $hit) {
+              Get-ChildItem -Path $dir -Recurse -File -Filter 'evi_*' | ForEach-Object { Write-Host $_.FullName }
+              throw "expected $pattern under $dir, got none"
+            }
+            return $hit.FullName
+          }
+
+          # Visual Studio multi-config generator drops outputs under Release/.
+          # MSVC naming: evi_crypto.lib (static or import) and evi_crypto.dll (shared).
+          Copy-Item (FindOne 'evi_crypto.lib' 'build-static') "$root/lib/evi_crypto.lib"
+          Copy-Item (FindOne 'evi_c_api.lib'  'build-static') "$root/lib/evi_c_api.lib"
+          Copy-Item (FindOne 'evi_crypto.dll' 'build-shared') "$root/lib/evi_crypto.dll"
+          # Import lib that pairs with the DLL (avoid name collision with static lib above).
+          Copy-Item (FindOne 'evi_crypto.lib' 'build-shared') "$root/lib/evi_crypto_import.lib"
+
+          Copy-Item -Recurse -Force 'include/*'          "$root/include/"
+          Copy-Item -Recurse -Force 'c_api/include/*'    "$root/include/"
+
+          $commit = (git rev-parse HEAD).Trim()
+          $now    = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $lines = @(
+            "name: evi-crypto",
+            "goos: $env:GOOS",
+            "goarch: $env:GOARCH",
+            "commit: $commit",
+            "ref: $env:GITHUB_REF",
+            "runner: windows-latest",
+            "built_at: $now"
+          )
+          $lines | Out-File -Encoding ASCII -FilePath "$root/PROVENANCE"
+
+          Push-Location $env:GITHUB_WORKSPACE
+          $archive = "$pkg.zip"
+          if (Test-Path $archive) { Remove-Item -Force $archive }
+          Compress-Archive -Path $pkg -DestinationPath $archive -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          "$hash  $archive" | Out-File -Encoding ASCII -FilePath "$archive.sha256"
+          Pop-Location
+
+          "name=$pkg"       >> $env:GITHUB_OUTPUT
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            ${{ steps.pkg.outputs.archive }}
+            ${{ steps.pkg.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) \
+            -exec cp {} dist/ \;
+          cd dist
+          # Combined manifest of every archive checksum.
+          ( sha256sum *.tar.gz 2>/dev/null || true; sha256sum *.zip 2>/dev/null || true ) \
+            | sort > SHA256SUMS
+          ls -la
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
