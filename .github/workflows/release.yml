@@ -52,7 +52,6 @@ jobs:
     env:
       GOOS: linux
       GOARCH: ${{ matrix.goarch }}
-      SHARED_EXT: so
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,23 +87,6 @@ jobs:
       - name: Build static
         run: cmake --build build-static --parallel
 
-      - name: Configure shared
-        run: |
-          cmake -S . -B build-shared -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TEST=OFF \
-            -DBUILD_EXAMPLE=OFF \
-            -DBUILD_WITH_VALGRIND=OFF \
-            -DBUILD_C_API=ON \
-            -DBUILD_KEY_MANAGEMENT=ON \
-            -DEVI_KM_PREFER_AWS_SDK=OFF \
-            -DEVI_KM_PREFER_GCP_SDK=OFF \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DBUILD_AS_STATIC=OFF
-
-      - name: Build shared
-        run: cmake --build build-shared --parallel
-
       - name: Assemble package
         id: pkg
         shell: bash
@@ -115,8 +97,6 @@ jobs:
           rm -rf "${root}"
           mkdir -p "${root}/lib" "${root}/include"
 
-          # locate the freshly built libs (cmake may place them under lib/ in
-          # some configurations, otherwise at the top of the build dir)
           find_one() {
             local pattern="$1" dir="$2"
             local hit
@@ -129,16 +109,13 @@ jobs:
             echo "${hit}"
           }
 
-          cp "$(find_one 'libevi_crypto.a'           build-static)" "${root}/lib/"
-          cp "$(find_one 'libevi_c_api.a'            build-static)" "${root}/lib/"
-          cp "$(find_one "libevi_crypto.${SHARED_EXT}" build-shared)" "${root}/lib/"
+          cp "$(find_one 'libevi_crypto.a' build-static)" "${root}/lib/"
+          cp "$(find_one 'libevi_c_api.a'  build-static)" "${root}/lib/"
 
-          # headers: everything under include/ (C++ API) and c_api/include/
-          # (C ABI umbrella + evi_c/*.h) merged into one tree.
-          cp -R include/. "${root}/include/"
+          # headers: C++ API (include/) + C ABI wrapper (c_api/include/) merged.
+          cp -R include/.       "${root}/include/"
           cp -R c_api/include/. "${root}/include/"
 
-          # provenance marker
           {
             echo "name: evi-crypto"
             echo "goos: ${GOOS}"
@@ -181,7 +158,6 @@ jobs:
     env:
       GOOS: darwin
       GOARCH: ${{ matrix.goarch }}
-      SHARED_EXT: dylib
       OSX_ARCH: ${{ matrix.osx_arch }}
       BREW_PREFIX: ${{ matrix.brew_prefix }}
     steps:
@@ -234,34 +210,12 @@ jobs:
       - name: Build static
         run: cmake --build build-static --parallel
 
-      - name: Configure shared
-        run: |
-          set -euo pipefail
-          OPENSSL_ROOT="${BREW_PREFIX}/opt/openssl@3"
-          cmake -S . -B build-shared -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES="${OSX_ARCH}" \
-            -DBUILD_TEST=OFF \
-            -DBUILD_EXAMPLE=OFF \
-            -DBUILD_WITH_VALGRIND=OFF \
-            -DBUILD_C_API=ON \
-            -DBUILD_KEY_MANAGEMENT=ON \
-            -DEVI_KM_PREFER_AWS_SDK=OFF \
-            -DEVI_KM_PREFER_GCP_SDK=OFF \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DBUILD_AS_STATIC=OFF \
-            -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT}"
-
-      - name: Build shared
-        run: cmake --build build-shared --parallel
-
       - name: Verify produced architecture
         run: |
           set -euo pipefail
           for f in \
             build-static/libevi_crypto.a \
-            build-static/c_api/libevi_c_api.a \
-            "build-shared/libevi_crypto.${SHARED_EXT}"; do
+            build-static/c_api/libevi_c_api.a; do
             [[ -f "$f" ]] || continue
             echo "== lipo -info $f"
             lipo -info "$f" || file "$f"
@@ -289,11 +243,10 @@ jobs:
             echo "${hit}"
           }
 
-          cp "$(find_one 'libevi_crypto.a'           build-static)" "${root}/lib/"
-          cp "$(find_one 'libevi_c_api.a'            build-static)" "${root}/lib/"
-          cp "$(find_one "libevi_crypto.${SHARED_EXT}" build-shared)" "${root}/lib/"
+          cp "$(find_one 'libevi_crypto.a' build-static)" "${root}/lib/"
+          cp "$(find_one 'libevi_c_api.a'  build-static)" "${root}/lib/"
 
-          cp -R include/. "${root}/include/"
+          cp -R include/.       "${root}/include/"
           cp -R c_api/include/. "${root}/include/"
 
           {
@@ -335,7 +288,6 @@ jobs:
     env:
       GOOS: windows
       GOARCH: amd64
-      SHARED_EXT: dll
     steps:
       - name: Setup MSYS2 / MinGW-w64
         uses: msys2/setup-msys2@v2
@@ -372,23 +324,6 @@ jobs:
       - name: Build static
         run: cmake --build build-static --parallel
 
-      - name: Configure shared
-        run: |
-          cmake -S . -B build-shared -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TEST=OFF \
-            -DBUILD_EXAMPLE=OFF \
-            -DBUILD_WITH_VALGRIND=OFF \
-            -DBUILD_C_API=ON \
-            -DBUILD_KEY_MANAGEMENT=ON \
-            -DEVI_KM_PREFER_AWS_SDK=OFF \
-            -DEVI_KM_PREFER_GCP_SDK=OFF \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DBUILD_AS_STATIC=OFF
-
-      - name: Build shared
-        run: cmake --build build-shared --parallel
-
       - name: Assemble package
         id: pkg
         run: |
@@ -410,13 +345,10 @@ jobs:
             echo "${hit}"
           }
 
-          # MinGW-w64 / GCC naming:
-          #   static:  libevi_crypto.a, libevi_c_api.a   (GCC archives; cgo-linkable)
-          #   shared:  libevi_crypto.dll + libevi_crypto.dll.a import library
-          cp "$(find_one 'libevi_crypto.a'      build-static)" "${root}/lib/"
-          cp "$(find_one 'libevi_c_api.a'       build-static)" "${root}/lib/"
-          cp "$(find_one 'libevi_crypto.dll'    build-shared)" "${root}/lib/"
-          cp "$(find_one 'libevi_crypto.dll.a'  build-shared)" "${root}/lib/"
+          # MinGW-w64 / GCC archives (cgo-linkable). No shared DLL shipped —
+          # the consumer contract is a single statically-linked Go binary.
+          cp "$(find_one 'libevi_crypto.a' build-static)" "${root}/lib/"
+          cp "$(find_one 'libevi_c_api.a'  build-static)" "${root}/lib/"
 
           cp -R include/.       "${root}/include/"
           cp -R c_api/include/. "${root}/include/"
