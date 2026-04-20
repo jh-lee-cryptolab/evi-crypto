@@ -12,6 +12,11 @@ name: release artifacts
 #   lib/libevi_crypto.{so,dylib}           (shared core)         -- *nix
 #   lib/evi_crypto.lib / evi_crypto.dll    (static + shared)     -- Windows
 #   lib/libevi_c_api.a / evi_c_api.lib     (C wrapper, always static)
+#   lib/libdeb.a + lib/libalea.a           (CPM-sourced deps pulled into the
+#                                           artifact so cgo can resolve the
+#                                           C++ symbols libevi_crypto.a leaves
+#                                           undefined — pyenvector ships the
+#                                           same three-archive bundle.)
 #   include/                               (C++ headers + C wrapper headers)
 #   PROVENANCE                             (commit, ref, runner, timestamp)
 # then uploads the packed archive as a GitHub Actions artifact. On tag pushes
@@ -100,10 +105,11 @@ jobs:
           find_one() {
             local pattern="$1" dir="$2"
             local hit
-            hit="$(find "${dir}" -maxdepth 4 -type f -name "${pattern}" | head -n 1)"
+            hit="$(find "${dir}" -maxdepth 6 -type f -name "${pattern}" | head -n 1)"
             if [[ -z "${hit}" ]]; then
               echo "expected ${pattern} under ${dir}, got none" >&2
-              find "${dir}" -maxdepth 4 -type f -name 'libevi*' >&2 || true
+              find "${dir}" -maxdepth 6 -type f \
+                \( -name 'libevi*' -o -name 'libdeb*' -o -name 'libalea*' \) >&2 || true
               exit 1
             fi
             echo "${hit}"
@@ -111,6 +117,11 @@ jobs:
 
           cp "$(find_one 'libevi_crypto.a' build-static)" "${root}/lib/"
           cp "$(find_one 'libevi_c_api.a'  build-static)" "${root}/lib/"
+          # libevi_crypto.a leaves deb::* / alea_* symbols unresolved; ship the
+          # CPM-built dependency archives alongside so cgo's link step can close
+          # the graph. Matches pyenvector's evi/lib/ layout.
+          cp "$(find_one 'libdeb.a'        build-static)" "${root}/lib/"
+          cp "$(find_one 'libalea.a'       build-static)" "${root}/lib/"
 
           # headers: C++ API (include/) + C ABI wrapper (c_api/include/) merged.
           cp -R include/.       "${root}/include/"
@@ -234,10 +245,11 @@ jobs:
           find_one() {
             local pattern="$1" dir="$2"
             local hit
-            hit="$(find "${dir}" -maxdepth 4 -type f -name "${pattern}" | head -n 1)"
+            hit="$(find "${dir}" -maxdepth 6 -type f -name "${pattern}" | head -n 1)"
             if [[ -z "${hit}" ]]; then
               echo "expected ${pattern} under ${dir}, got none" >&2
-              find "${dir}" -maxdepth 4 -type f -name 'libevi*' >&2 || true
+              find "${dir}" -maxdepth 6 -type f \
+                \( -name 'libevi*' -o -name 'libdeb*' -o -name 'libalea*' \) >&2 || true
               exit 1
             fi
             echo "${hit}"
@@ -245,6 +257,11 @@ jobs:
 
           cp "$(find_one 'libevi_crypto.a' build-static)" "${root}/lib/"
           cp "$(find_one 'libevi_c_api.a'  build-static)" "${root}/lib/"
+          # libevi_crypto.a leaves deb::* / alea_* symbols unresolved; ship the
+          # CPM-built dependency archives alongside so cgo's link step can close
+          # the graph. Matches pyenvector's evi/lib/ layout.
+          cp "$(find_one 'libdeb.a'        build-static)" "${root}/lib/"
+          cp "$(find_one 'libalea.a'       build-static)" "${root}/lib/"
 
           cp -R include/.       "${root}/include/"
           cp -R c_api/include/. "${root}/include/"
@@ -336,10 +353,11 @@ jobs:
           find_one() {
             local pattern="$1" dir="$2"
             local hit
-            hit="$(find "${dir}" -maxdepth 4 -type f -name "${pattern}" | head -n 1)"
+            hit="$(find "${dir}" -maxdepth 6 -type f -name "${pattern}" | head -n 1)"
             if [[ -z "${hit}" ]]; then
               echo "expected ${pattern} under ${dir}, got none" >&2
-              find "${dir}" -maxdepth 4 -type f \( -name 'libevi*' -o -name 'evi_*' \) >&2 || true
+              find "${dir}" -maxdepth 6 -type f \
+                \( -name 'libevi*' -o -name 'evi_*' -o -name 'libdeb*' -o -name 'libalea*' \) >&2 || true
               exit 1
             fi
             echo "${hit}"
@@ -349,6 +367,11 @@ jobs:
           # the consumer contract is a single statically-linked Go binary.
           cp "$(find_one 'libevi_crypto.a' build-static)" "${root}/lib/"
           cp "$(find_one 'libevi_c_api.a'  build-static)" "${root}/lib/"
+          # libevi_crypto.a leaves deb::* / alea_* symbols unresolved; ship the
+          # CPM-built dependency archives alongside so cgo's link step can close
+          # the graph. Matches pyenvector's evi/lib/ layout.
+          cp "$(find_one 'libdeb.a'        build-static)" "${root}/lib/"
+          cp "$(find_one 'libalea.a'       build-static)" "${root}/lib/"
 
           cp -R include/.       "${root}/include/"
           cp -R c_api/include/. "${root}/include/"
